@@ -1762,6 +1762,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     return;
                 }
 
+                // measurement probe (LLAMA_SPEC_FAKE_DRAFT=1): skip the logits sync and
+                // readback, emit constant garbage drafts. Output is WRONG; the only valid
+                // metric is time per round. The delta vs the normal path bounds what a
+                // device-fed verify batch (no draft->verify host serialization) could save.
+                static const bool fake_draft = [] {
+                    const char * s = getenv("LLAMA_SPEC_FAKE_DRAFT");
+                    return s && s[0] == '1' && s[1] == '\0';
+                }();
+                if (fake_draft) {
+                    auto & result = *dp.result;
+                    for (int j = 0; j < n_chain && (int) result.size() < params.n_max; ++j) {
+                        result.push_back(220);
+                    }
+                    return;
+                }
+
                 // the chain samples greedily in-graph and emits [token id, top prob]
                 // pairs as 2-float rows, packed from the start of the logits buffer;
                 // no host-side sampling pass runs over the draft logits

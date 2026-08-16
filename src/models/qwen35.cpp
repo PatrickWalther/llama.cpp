@@ -697,6 +697,16 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
                 return env != nullptr ? atoll(env) : 32768;
             }();
 
+            // With a vocab-split output head (LLAMA_META_MIRROR_OUTPUT unset) the
+            // sub-head slice lives on the first device only and the whole
+            // argmax/probe chain runs there; the picked id broadcasts between
+            // steps. The full-head chain needs every vocab row and therefore
+            // still requires the mirrored head.
+            static const bool head_mirrored = [] {
+                const char * env = getenv("LLAMA_META_MIRROR_OUTPUT");
+                return env != nullptr && env[0] == '1';
+            }();
+
             ggml_tensor * logits_j;
             if (n_sub_env > 0 && n_sub_env < head_w2->ne[1]) {
                 ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w2,
@@ -706,6 +716,8 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
                     logits_j = ggml_mul(ctx0, logits_j, head_s2);
                 }
             } else {
+                GGML_ASSERT(head_mirrored &&
+                    "full-vocab chain drafting (LLAMA_SPEC_CHAIN_SUB=0) requires LLAMA_META_MIRROR_OUTPUT=1");
                 logits_j = build_lora_mm(head_w2, h_next_j, head_s2);
             }
 
@@ -725,8 +737,15 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             h_all      = h_all      == nullptr ? h_next_j : ggml_concat(ctx0, h_all, h_next_j, 1);
 
             if (j + 1 < n_chain) {
-                // feed the argmax token and hidden state into the next step
-                ggml_tensor * tok_j = ggml_get_rows(ctx0, tok_embd_w, id_j);
+                // feed the argmax token and hidden state into the next step. With a
+                // split head the raw id lives on one device only; id_f crosses the
+                // reduction as a zero-padded sum (a broadcast), so casting it back
+                // to I32 hands every device the picked token for its get_rows.
+                ggml_tensor * id_next = id_j;
+                if (!head_mirrored) {
+                    id_next = ggml_reshape_1d(ctx0, ggml_cast(ctx0, id_f, GGML_TYPE_I32), 1);
+                }
+                ggml_tensor * tok_j = ggml_get_rows(ctx0, tok_embd_w, id_next);
                 proj_cur = build_proj(tok_j, h_next_j);
             }
         }

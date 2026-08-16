@@ -1111,7 +1111,13 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
                            __func__, i, tensors[i]->data, (int) type, ne);
             return false;
         }
-        GGML_ASSERT((ggml_nbytes(tensors[i]) & 0xF) == 0);
+        // payloads below one 16-byte wire vector (e.g. the 4-byte chain feedback id)
+        // fall back to the generic meta reduction rather than the chunked kernel
+        if ((ggml_nbytes(tensors[i]) & 0xF) != 0) {
+            GGML_LOG_DEBUG("%s: internal unsupported: tensor[%zu] nbytes=%zu is not a multiple of 16\n",
+                           __func__, i, ggml_nbytes(tensors[i]));
+            return false;
+        }
     }
 
     return ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors);
