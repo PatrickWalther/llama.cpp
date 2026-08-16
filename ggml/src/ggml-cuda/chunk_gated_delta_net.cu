@@ -672,6 +672,7 @@ static void ggml_cuda_op_gated_delta_net_chunked_impl(ggml_backend_cuda_context 
                                                       const float *               g_in,
                                                       const float *               b_in,
                                                       const float *               s_d,
+                                                      float *                     state_dst,
                                                       float                       scale,
                                                       long long                   v_tok_stride,
                                                       cudaStream_t                stream) {
@@ -711,8 +712,6 @@ static void ggml_cuda_op_gated_delta_net_chunked_impl(ggml_backend_cuda_context 
 
     // Stage 3 -- state+output pass: WMMA tensor cores, fixed tile (BV=32/NT=256/OCC=4). ~30 KB
     // dynamic SMEM, under the 48 KB default, so no cudaFuncAttribute opt-in needed.
-    const int64_t state_offset = (int64_t) V_dim * H * T * B;
-    float *       state_dst    = (float *) dst->data + state_offset;
     {
         constexpr int BV = 32, NT = 256, OCC = 4;
         const size_t  st_smem = cgdr_smem_state_wmma(CS, 128, BV);
@@ -731,9 +730,13 @@ static void ggml_cuda_op_gated_delta_net_chunked_impl(ggml_backend_cuda_context 
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Public entry: validates the op, extracts dims, and runs the pipeline. Selected by the
-// eligibility check in gated_delta_net.cu; otherwise the recurrent path runs.
-void ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// Range entry: runs the chunked pipeline over the first T_range tokens and writes the final
+// recurrent state to state_dst. The K>1 dispatch in gated_delta_net.cu uses this to process the
+// prefix, then replays the last K tokens with the recurrent kernel to rebuild the rollback
+// snapshot slots. Partial ranges derive per-sequence strides from T_range, so they require B == 1
+// (the dispatch predicate enforces this).
+void ggml_cuda_op_gated_delta_net_chunked_range(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                                int T_range, float * state_dst) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_k     = dst->src[1];
     const ggml_tensor * src_v     = dst->src[2];
@@ -790,9 +793,23 @@ void ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_
     const float * b_in = (const float *) src_beta->data;
 
     // Recurrent (gated_delta_net.cu) handles everything this path can't
-    // (kda, K>1, K!=128, non-contiguous, single-token decode).
-    // num_chunks = ceil(T/CS): the last chunk may be partial; the kernels guard the padding tokens.
-    const int num_chunks = (T + 15) / 16;
-    ggml_cuda_op_gated_delta_net_chunked_impl(ctx, dst, B, T, H, num_k_heads, K_dim, V_dim, num_chunks, q_in, k_in,
-                                              v_in, g_in, b_in, s_d, scale, v_tok_stride, stream);
+    // (kda, K!=128, non-contiguous, single-token decode).
+    GGML_ASSERT(T_range > 0 && T_range <= T);
+    GGML_ASSERT((T_range == T || B == 1) && "chunked GDN partial range requires a single sequence");
+    // num_chunks = ceil(T_range/CS): the last chunk may be partial; the kernels guard the padding tokens.
+    const int num_chunks = (T_range + 15) / 16;
+    ggml_cuda_op_gated_delta_net_chunked_impl(ctx, dst, B, T_range, H, num_k_heads, K_dim, V_dim, num_chunks, q_in,
+                                              k_in, v_in, g_in, b_in, s_d, state_dst, scale, v_tok_stride, stream);
+}
+
+// Public entry: full token range, final state to the dst tail (snapshot slot 0). Selected by the
+// eligibility check in gated_delta_net.cu; otherwise the recurrent path runs.
+void ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src_v = dst->src[2];
+    const int64_t V_dim = src_v->ne[0];
+    const int64_t H     = src_v->ne[1];
+    const int64_t T     = src_v->ne[2];
+    const int64_t B     = src_v->ne[3];
+    float * state_dst = (float *) dst->data + V_dim * H * T * B;
+    ggml_cuda_op_gated_delta_net_chunked_range(ctx, dst, (int) T, state_dst);
 }
