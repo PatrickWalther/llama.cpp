@@ -117,6 +117,11 @@ public:
     bool next()  override;
     bool apply() override;
 
+    bool needs_graph_reserve() const override {
+        return (ctx_attn && ctx_attn->needs_graph_reserve()) ||
+               (ctx_recr && ctx_recr->needs_graph_reserve());
+    }
+
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 

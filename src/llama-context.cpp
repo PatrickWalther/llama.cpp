@@ -807,6 +807,8 @@ bool llama_context::memory_update(bool optimize) {
         return false;
     }
 
+    bool need_reserve = true;
+
     {
         const auto mctx = memory->init_update(this, optimize);
         switch (mctx->get_status()) {
@@ -827,15 +829,27 @@ bool llama_context::memory_update(bool optimize) {
                 }
         }
 
-        // reset the previous graph results to make sure that they won't be reused
-        // TODO: change the mctx->apply() to return information if a graph reserve is needed
-        //       reset the graph result only if the memory module did reset the scheduler
-        gf_res_prev->reset();
-        gf_res_alloced = nullptr;
+        // Stream-copy-only updates (seq_cp between KV streams) run as direct
+        // backend copies under stable tensor views: cached graphs stay correct
+        // (k/v idxs and masks are host inputs regenerated per eval) and no
+        // scheduler is touched, so both the graph-result reset and the
+        // worst-case re-reserve can be skipped. The K-shift path still resets.
+        // Gated until fully validated: LLAMA_KV_DIRECT_SEQCP=1.
+        static const bool direct_seqcp = [] {
+            const char * s = getenv("LLAMA_KV_DIRECT_SEQCP");
+            return s != nullptr && s[0] == '1' && s[1] == '\0';
+        }();
+        need_reserve = !direct_seqcp || mctx->needs_graph_reserve();
 
-        for (auto & s : sched_pool) {
-            s.gf_res->reset();
-            s.alloced = nullptr;
+        if (need_reserve) {
+            // reset the previous graph results to make sure that they won't be reused
+            gf_res_prev->reset();
+            gf_res_alloced = nullptr;
+
+            for (auto & s : sched_pool) {
+                s.gf_res->reset();
+                s.alloced = nullptr;
+            }
         }
 
         if (!mctx->apply()) {
@@ -844,7 +858,7 @@ bool llama_context::memory_update(bool optimize) {
     }
 
     // if the memory module did any computation, we have to reserve a new worst-case graph
-    {
+    if (need_reserve) {
         const auto mctx = memory->init_full();
         if (!mctx) {
             throw std::runtime_error("failed to initialize memory context");

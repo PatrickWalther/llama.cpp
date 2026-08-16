@@ -357,6 +357,10 @@ public:
     bool next()  override;
     bool apply() override;
 
+    // stream-copy-only updates run as direct backend copies under stable views;
+    // only the K-shift path builds a graph and resets the scheduler
+    bool needs_graph_reserve() const override { return do_shift; }
+
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 

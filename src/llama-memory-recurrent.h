@@ -156,6 +156,10 @@ public:
     bool next()  override;
     bool apply() override;
 
+    // recurrent updates are cell metadata only; state copies resolve inside
+    // the next decode graph
+    bool needs_graph_reserve() const override { return false; }
+
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 

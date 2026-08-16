@@ -64,6 +64,12 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // whether apply() may touch a scheduler or change graph-relevant memory
+    // layout. Meaningful for update contexts: when false, the caller can keep
+    // its cached graphs and skip the post-update graph reserve (stream copies
+    // mutate bytes under stable tensor views, never the views themselves).
+    virtual bool needs_graph_reserve() const { return true; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
