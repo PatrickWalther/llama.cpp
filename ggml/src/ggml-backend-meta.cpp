@@ -674,7 +674,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     // Some ops process data on a per-row bases:
     auto handle_per_row = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0);
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            GGML_LOG_ERROR("%s: per-row op %s ('%s') over a row-split source '%s'\n", __func__,
+                ggml_op_name(tensor->op), tensor->name, tensor->src[0] ? tensor->src[0]->name : "?");
+            GGML_ABORT("per-row op over a row-split source");
+        }
         return src_ss[0];
     };
 
@@ -806,33 +810,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_view = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        // A leading range view along the source's split axis (all other dims full,
-        // offset 0) selects rows that live entirely on the first device whenever the
-        // range fits its share. Classify it single-device instead of letting the
-        // proportional recompute slice every device's shard - that would silently
-        // select the wrong rows (device 1's slice would start at its shard base, not
-        // at the global row index). Used by the chain sub-head vocab slice.
-        {
-            const auto & ss0 = src_ss[0];
-            if (ss0.axis >= 0 && ss0.axis < GGML_MAX_DIMS && ss0.n_segments == 1 &&
-                    sd_device(ss0) < 0 && tensor->view_offs == 0 &&
-                    tensor->ne[ss0.axis] < tensor->src[0]->ne[ss0.axis]) {
-                bool leading_range = true;
-                for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
-                    if (dim != ss0.axis && tensor->ne[dim] != tensor->src[0]->ne[dim]) {
-                        leading_range = false;
-                        break;
-                    }
-                }
-                if (leading_range) {
-                    GGML_ASSERT(tensor->ne[ss0.axis] <= ss0.ne[0] &&
-                        "range view of a split tensor must fit inside the first device's share");
-                    ggml_backend_meta_split_state ret = {ss0.axis, {0}, {1}, 1};
-                    ret.ne[0] = tensor->ne[ss0.axis];
-                    return ret;
-                }
-            }
-        }
         if (ggml_is_contiguous(tensor) && ggml_is_contiguous(tensor->src[0])) {
             return handle_reshape(src_ss);
         }
@@ -1027,6 +1004,36 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // row count on the owning device; re-views of single-device data stay
         // single-device. Ops that copy into existing tensors are excluded: a
         // single-device write into a mirrored/split destination would desync it.
+        // A leading range view along the source's split axis (all other dims full,
+        // offset 0) selects rows that live entirely on the first device whenever the
+        // range fits its share. Classify it single-device instead of letting the
+        // proportional recompute slice every device's shard - that would silently
+        // select the wrong rows (device 1's slice would start at its shard base,
+        // not at the global row index). Must return directly from here: the share
+        // epilogue after the op switch would rescale the state proportionally.
+        // Used by the chain sub-head vocab slice.
+        if (tensor->op == GGML_OP_VIEW && tensor->view_offs == 0) {
+            const auto & ss0 = src_ss[0];
+            if (ss0.axis >= 0 && ss0.axis < GGML_MAX_DIMS && ss0.n_segments == 1 &&
+                    sd_device(ss0) < 0 &&
+                    tensor->ne[ss0.axis] < tensor->src[0]->ne[ss0.axis]) {
+                bool leading_range = true;
+                for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                    if (dim != ss0.axis && tensor->ne[dim] != tensor->src[0]->ne[dim]) {
+                        leading_range = false;
+                        break;
+                    }
+                }
+                if (leading_range) {
+                    GGML_ASSERT(tensor->ne[ss0.axis] <= ss0.ne[0] &&
+                        "range view of a split tensor must fit inside the first device's share");
+                    ggml_backend_meta_split_state ret = {ss0.axis, {0}, {1}, 1};
+                    ret.ne[0] = tensor->ne[ss0.axis];
+                    return ret;
+                }
+            }
+        }
+
         {
             const bool sd_view = tensor->view_src != nullptr && sd_device(src_ss[0]) >= 0;
             const bool sd_op_ok = tensor->view_src == nullptr &&
@@ -1743,6 +1750,52 @@ static void ggml_backend_meta_buffer_reset(ggml_backend_buffer_t buffer) {
     for (size_t i = 0; i < buf_ctx->bufs.size(); i++) {
         ggml_backend_buffer_reset(ggml_backend_meta_buffer_simple_buffer(buffer, i));
     }
+}
+
+static bool ggml_backend_meta_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    // Shard-wise device copy between two meta tensors with identical split states
+    // (e.g. KV cache stream copies). Without this, ggml_backend_tensor_copy stages
+    // the whole tensor through unpinned host memory - hundreds of MB per stream
+    // copy on large KV buffers. Any mismatch falls back to that generic path.
+    GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
+    if (src->buffer == nullptr || !ggml_backend_buffer_is_meta(src->buffer)) {
+        return false;
+    }
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    if (ggml_backend_meta_buffer_n_bufs(src->buffer) != n_bufs) {
+        return false;
+    }
+    const ggml_backend_meta_split_state ss_src = ggml_backend_meta_get_split_state(src, /*assume_sync =*/ false);
+    const ggml_backend_meta_split_state ss_dst = ggml_backend_meta_get_split_state(dst, /*assume_sync =*/ false);
+    // partial sums have device-dependent contents; leave them to the generic path
+    if (ss_src.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL || ss_dst.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+        return false;
+    }
+    if (ss_src.axis != ss_dst.axis || ss_src.n_segments != ss_dst.n_segments) {
+        return false;
+    }
+    for (uint32_t s = 0; s < ss_src.n_segments; s++) {
+        if (ss_src.nr[s] != ss_dst.nr[s]) {
+            return false;
+        }
+        for (size_t j = 0; j < n_bufs; j++) {
+            if (ss_src.ne[s*n_bufs + j] != ss_dst.ne[s*n_bufs + j]) {
+                return false;
+            }
+        }
+    }
+    for (size_t j = 0; j < n_bufs; j++) {
+        ggml_tensor * src_j = ggml_backend_meta_buffer_simple_tensor(src, j);
+        ggml_tensor * dst_j = ggml_backend_meta_buffer_simple_tensor(dst, j);
+        if (src_j == nullptr || dst_j == nullptr) {
+            return false;
+        }
+        if (ggml_nbytes(src_j) == 0) {
+            continue;
+        }
+        ggml_backend_tensor_copy(src_j, dst_j);
+    }
+    return true;
 }
 
 static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
