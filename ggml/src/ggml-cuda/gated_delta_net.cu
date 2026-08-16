@@ -242,24 +242,34 @@ bool ggml_cuda_gdn_op_is_chunked(const ggml_tensor * dst) {
     const bool    kda      = (src_g->ne[0] == S_v);
     const int     K        = ggml_get_op_params_i32(dst, 0);
 
-    // Disabled only when explicitly truthy; "0" (or unset) keeps the chunked path on.
+    // Opt-in on this fork (GGML_CUDA_GDN_CHUNK=1). Measured 2026-08-16 on 2x RTX 5090 -sm tensor:
+    // the chunked pipeline loses 4-6% prefill against the local recurrent kernel (which has PDL
+    // sync and the fused cache write that upstream's baseline lacks), and its CUDA-graph opt-out
+    // slows subsequent decode by ~15%. Kept for future faster chunked kernels; the K>1 replay
+    // split below is validated (bit-identical greedy output through spec rollback at 32k).
     static const bool chunk_disabled = [] {
-        const char * s = getenv("GGML_CUDA_DISABLE_GDN_CHUNK");
-        return s && s[0] && !(s[0] == '0' && s[1] == '\0');
+        const char * s = getenv("GGML_CUDA_GDN_CHUNK");
+        return !(s && s[0] == '1' && s[1] == '\0');
     }();
     const int  cc_dev    = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     // NVIDIA-only for now. The HIP/MUSA ggml_cuda_mma backend intentionally not dispatched until validated.
     const bool is_nvidia = GGML_CUDA_CC_IS_NVIDIA(cc_dev);
 
-    // - NVIDIA Ampere+ (fp16 WMMA); not KDA; K == 1 (final state only)
+    const int64_t n_seqs = src_v->ne[3];
+
+    // - NVIDIA Ampere+ (fp16 WMMA); not KDA
+    // - K == 1: chunked over the full range (final state only).
+    //   K > 1 (spec-decode rollback snapshots): chunked over the first n_tokens-K tokens, then the
+    //   recurrent kernel replays the last K to rebuild every snapshot slot. The partial range
+    //   derives per-sequence strides from its own length, so it requires a single sequence.
     // - Q/K/G/beta/state must be contiguous
-    //   (nb[0]/nb[1] packed) with arbitrary token stride (fused QKV view) 
+    //   (nb[0]/nb[1] packed) with arbitrary token stride (fused QKV view)
     // - V is packed per token (nb[2]) and across sequences (nb[3] == n_tokens*nb[2]).
-    // - 128-wide heads, GQA-aligned head counts, n_tokens >= 128
+    // - 128-wide heads, GQA-aligned head counts, n_tokens >= 128 (and > K so the split is non-empty)
     return is_nvidia
         && cc_dev >= GGML_CUDA_CC_AMPERE
         && !chunk_disabled
-        && !kda && K == 1
+        && !kda && (K == 1 || (n_seqs == 1 && n_tokens > K))
         && neq0 == 128 && S_v == 128 && nev1 % neq1 == 0
         && src_k->ne[1] == neq1
         && n_tokens >= 128
@@ -337,7 +347,32 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     // Route to the chunked prefill kernel when eligible.
     if (cache == nullptr && ggml_cuda_gdn_op_is_chunked(dst)) {
-        ggml_cuda_op_gated_delta_net_chunked(ctx, dst);
+        if (!keep_rs) {
+            ggml_cuda_op_gated_delta_net_chunked(ctx, dst);
+            return;
+        }
+        // K > 1: the chunked kernel produces only the final state, but spec-decode rollback needs
+        // the last K per-token states (snapshot slot s = state after token n_tokens-1-s). Split:
+        // chunked over the prefix [0, n_head), recurrent keep_rs replay over the last K tokens.
+        // The predicate guarantees n_seqs == 1 and n_tokens > K here.
+        const int64_t tail   = K;
+        const int64_t n_head = n_tokens - tail;
+
+        // Chunked prefix: attention rows [0, n_head), final state into snapshot slot 0. The replay
+        // reads slot 0 as its seed before overwriting it; each block touches only its own
+        // (head, row-group) slice, so the in-place hand-off cannot race across blocks.
+        float * state_tail = dst_d + S_v * H * n_tokens;
+        ggml_cuda_op_gated_delta_net_chunked_range(ctx, dst, (int) n_head, state_tail);
+
+        // Recurrent replay of the last K tokens: attention rows [n_head, n_tokens) and all K
+        // snapshot slots, exactly as a full recurrent pass would have written them.
+        const int64_t slot_stride = S_v * S_v * H; // n_seqs == 1 in this path
+        launch_gated_delta_net<false, true>(
+            q_d + n_head * sq2, k_d + n_head * sq2, v_d + n_head * sv2,
+            g_d + n_head * sb2, b_d + n_head * sb2, state_tail,
+            dst_d + n_head * S_v * H, state_tail,
+            S_v, H, tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+            sb1, sb2, sb3, neqk1, rq3, scale, slot_stride, K, stream);
         return;
     }
 
