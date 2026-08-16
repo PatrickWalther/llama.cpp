@@ -678,6 +678,24 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return src_ss[0];
     };
 
+    // Single-device state: an axis split where exactly one device holds a nonzero share.
+    // Returns that device index, or -1 if the state is not single-device.
+    auto sd_device = [&](const ggml_backend_meta_split_state & ss) -> int {
+        if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS || ss.n_segments != 1) {
+            return -1;
+        }
+        int dev = -1;
+        for (size_t j = 0; j < n_bufs; j++) {
+            if (ss.ne[j] != 0) {
+                if (dev != -1) {
+                    return -1;
+                }
+                dev = (int) j;
+            }
+        }
+        return dev;
+    };
+
     // Some ops broadcast the src1 data across src0:
     auto handle_bin_bcast = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
@@ -772,6 +790,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_cpy = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // A materializing F32 cast of a single-device tensor is the single-device ->
+        // everywhere transition: the owning device contributes the data, the other
+        // devices contribute zeros, and the AllReduce sum acts as a broadcast. The
+        // chain-drafting feedback id rides this (4-byte payload). F32 only - the
+        // reduction path only implements floating-point addition.
+        if (tensor->view_src == nullptr && tensor->type == GGML_TYPE_F32 &&
+                sd_device(src_ss[0]) >= 0) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS) {
             return handle_reshape(src_ss);
         }
@@ -779,6 +806,33 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_view = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // A leading range view along the source's split axis (all other dims full,
+        // offset 0) selects rows that live entirely on the first device whenever the
+        // range fits its share. Classify it single-device instead of letting the
+        // proportional recompute slice every device's shard - that would silently
+        // select the wrong rows (device 1's slice would start at its shard base, not
+        // at the global row index). Used by the chain sub-head vocab slice.
+        {
+            const auto & ss0 = src_ss[0];
+            if (ss0.axis >= 0 && ss0.axis < GGML_MAX_DIMS && ss0.n_segments == 1 &&
+                    sd_device(ss0) < 0 && tensor->view_offs == 0 &&
+                    tensor->ne[ss0.axis] < tensor->src[0]->ne[ss0.axis]) {
+                bool leading_range = true;
+                for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                    if (dim != ss0.axis && tensor->ne[dim] != tensor->src[0]->ne[dim]) {
+                        leading_range = false;
+                        break;
+                    }
+                }
+                if (leading_range) {
+                    GGML_ASSERT(tensor->ne[ss0.axis] <= ss0.ne[0] &&
+                        "range view of a split tensor must fit inside the first device's share");
+                    ggml_backend_meta_split_state ret = {ss0.axis, {0}, {1}, 1};
+                    ret.ne[0] = tensor->ne[ss0.axis];
+                    return ret;
+                }
+            }
+        }
         if (ggml_is_contiguous(tensor) && ggml_is_contiguous(tensor->src[0])) {
             return handle_reshape(src_ss);
         }
@@ -962,6 +1016,51 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
             }
             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+        }
+
+        // Single-device short-circuit: when every source is either mirrored or lives
+        // entirely on one common device, the op computes on that device alone and the
+        // result is single-device as well (other devices hold zero-size shadows with
+        // compute disabled). This legalizes per-row ops (argmax, softmax, get_rows,
+        // concat) over a single-device vocab slice - the chain-drafting sub-head path.
+        // Convention: single-device results are expressed as AXIS_0 with the whole
+        // row count on the owning device; re-views of single-device data stay
+        // single-device. Ops that copy into existing tensors are excluded: a
+        // single-device write into a mirrored/split destination would desync it.
+        {
+            const bool sd_view = tensor->view_src != nullptr && sd_device(src_ss[0]) >= 0;
+            const bool sd_op_ok = tensor->view_src == nullptr &&
+                tensor->op != GGML_OP_CPY && tensor->op != GGML_OP_DUP &&
+                tensor->op != GGML_OP_SET && tensor->op != GGML_OP_SET_ROWS &&
+                tensor->op != GGML_OP_ACC && tensor->op != GGML_OP_NONE;
+            int  common_dev = -1;
+            bool any_sd     = false;
+            bool applicable = sd_view || sd_op_ok;
+            if (applicable && sd_view) {
+                common_dev = sd_device(src_ss[0]);
+                any_sd     = true;
+            } else if (applicable) {
+                for (size_t i = 0; i < GGML_MAX_SRC && applicable; i++) {
+                    if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+                        continue;
+                    }
+                    if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                        continue;
+                    }
+                    const int dev = sd_device(src_ss[i]);
+                    if (dev < 0 || (common_dev != -1 && dev != common_dev)) {
+                        applicable = false;
+                        break;
+                    }
+                    common_dev = dev;
+                    any_sd     = true;
+                }
+            }
+            if (applicable && any_sd && common_dev >= 0) {
+                ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+                ret.ne[common_dev] = tensor->ne[0];
+                return ret;
+            }
         }
 
         ggml_backend_meta_split_state split_state;
