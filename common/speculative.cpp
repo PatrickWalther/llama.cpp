@@ -1450,6 +1450,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             common_batch_add(batch, defer.tok[k], defer.pos[k], { defer.seq[k] }, false);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, defer.embd.data() + k * (size_t) n_embd, row_bytes);
         }
+        // Drop every draft cell at or past the first deferred position of each
+        // sequence, for the same reason as the catch-up decode: ctx_dft may
+        // still hold these positions, and the decode below is about to write
+        // them again. M-RoPE then takes the strict batch validator, which
+        // requires X < Y, and llama_decode returns rc = -1 instead of the
+        // rc = 1 that only means "no KV slot". The server turns that into
+        // HTTP 500 "failed to process speculative batch" and loses the turn.
+        // Read the positions before the vectors are cleared below.
+        {
+            auto * mem_dft = llama_get_memory(ctx_dft);
+            std::vector<llama_pos> pos_min(n_seq, -1);
+            for (size_t k = 0; k < defer.tok.size(); ++k) {
+                const llama_seq_id seq_id = defer.seq[k];
+                if (pos_min[seq_id] < 0 || defer.pos[k] < pos_min[seq_id]) {
+                    pos_min[seq_id] = defer.pos[k];
+                }
+            }
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (pos_min[seq_id] >= 0) {
+                    llama_memory_seq_rm(mem_dft, seq_id, pos_min[seq_id], -1);
+                }
+            }
+        }
+
         defer.tok.clear();
         defer.pos.clear();
         defer.seq.clear();
