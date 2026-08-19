@@ -1631,14 +1631,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
-                if (chain_heads) {
-                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
-                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                        if (i_batch_beg[seq_id] < 0) {
-                            continue;
-                        }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+                // Drop every draft cell at or past the first incoming position
+                // before the decode re-evaluates it.
+                //
+                // This runs for EVERY model, not only the chain_heads ones. A
+                // model with nextn_predict_layers = 1 (Qwen3.5/3.8) has
+                // chain_heads = false, so this removal used to be skipped. The
+                // decode below then wrote positions that ctx_dft still held.
+                // M-RoPE takes the strict batch validator (llama-batch.cpp:
+                // "for M-RoPE, it is required that: X < Y") because the MTP
+                // batch carries both token and embd, so the collision returned
+                // rc = -1, not the rc = 1 that means "no KV slot". The server
+                // turned that into HTTP 500 "failed to process speculative
+                // batch" and lost the turn.
+                //
+                // The other removal, in the deferred-row block above, does not
+                // cover this: it is gated behind !defer.tok.empty(). A prefill
+                // chunk larger than defer_max arrives with an empty defer
+                // buffer, so neither path cleared the cells.
+                // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
                     }
+                    llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+                }
+                if (chain_heads) {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
